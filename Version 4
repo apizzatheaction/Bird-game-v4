@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Flappy Bananas</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: #9be7ff; /* fallback while canvas loads */
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      touch-action: manipulation; /* reduce delays on iOS */
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    }
+    #wrap {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: #7dd3fc;
+    }
+    canvas {
+      display: block;
+      width: min(100vw, 100vh * 9/16);   /* keep ~16:9 area on phones */
+      height: min(100vh, 100vw * 16/9);
+      max-width: 100vw;
+      max-height: 100vh;
+      background: linear-gradient(#87ceeb, #b3ecff);
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.2);
+      touch-action: none; /* prevent scrolling while tapping */
+    }
+    .hint {
+      position: fixed;
+      bottom: env(safe-area-inset-bottom, 12px);
+      left: 0; right: 0;
+      text-align: center;
+      color: #073b4c;
+      opacity: .8;
+      font-size: 14px;
+      pointer-events: none;
+    }
+    .cta {
+      position: fixed;
+      top: env(safe-area-inset-top, 10px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(255,255,255,.8);
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" aria-label="Flappy Bananas game"></canvas>
+  </div>
+  <div class="hint">tap to flap · collect bananas (+1) · pineapples (+2) · gets faster as you score</div>
+  <div class="cta">Add to Home Screen for full-screen play</div>
+
+  <script>
+  (() => {
+    // ---------- Canvas & sizing (hi-DPI aware) ----------
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    // Virtual coordinate system for consistent gameplay
+    const VW = 360, VH = 640;
+    function resize() {
+      // Scale canvas to device pixels for crisp rendering
+      const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+      canvas.width = VW * dpr;
+      canvas.height = VH * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in virtual units
+      drawSplash();
+    }
+    window.addEventListener('resize', resize, { passive: true });
+    resize();
+
+    // ---------- Game state ----------
+    const state = {
+      mode: 'splash', // 'splash' | 'play' | 'over'
+      score: 0,
+      speed: 2.8,         // world scroll speed (increases with score)
+      baseSpeed: 2.8,
+      gravity: 0.45,
+      flap: -7.5,
+      t: 0,               // global time
+      spawnCooldown: 0,   // fruit spawn timer
+      fruits: [],
+      bird: { x: 80, y: VH/2, vy: 0, r: 16, flapAnim: 0 },
+      groundY: VH - 32,
+    };
+
+    // ---------- Controls ----------
+    const flap = () => {
+      if (state.mode === 'splash') startGame();
+      else if (state.mode === 'play') state.bird.vy = state.flap;
+      else if (state.mode === 'over') startGame();
+    };
+
+    // Use pointer events to cover both mouse & touch
+    const events = ['pointerdown', 'keydown'];
+    window.addEventListener('pointerdown', e => { e.preventDefault(); flap(); });
+    window.addEventListener('keydown', e => { if (e.code === 'Space' || e.key === ' ') { e.preventDefault(); flap(); } });
+
+    // Prevent bounce/scroll on iOS during rapid taps
+    document.addEventListener('gesturestart', e => e.preventDefault());
+
+    // Pause when tab hidden (saves battery)
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && state.mode === 'play') state.mode = 'splash', drawSplash();
+    });
+
+    // ---------- Fruit helpers ----------
+    const FRUIT = {
+      BANANA: 0,
+      PINEAPPLE: 1
+    };
+    function spawnFruit() {
+      const type = Math.random() < 0.82 ? FRUIT.BANANA : FRUIT.PINEAPPLE; // pineapple rarer
+      const r = type === FRUIT.BANANA ? 12 : 14;
+      const yPadding = 60;
+      const y = Math.random() * (state.groundY - yPadding*2) + yPadding;
+      const x = VW + 20;
+      const vx = -state.speed; // will be updated every frame to match speed increases
+      state.fruits.push({ x, y, r, vx, type, eaten: false });
+    }
+
+    // ---------- Drawing (vector art, no assets needed) ----------
+    function drawBackground() {
+      // Sky
+      const g = ctx.createLinearGradient(0,0,0,VH);
+      g.addColorStop(0, '#7cd3ff');
+      g.addColorStop(1, '#c8f1ff');
+      ctx.fillStyle = g;
+      ctx.fillRect(0,0,VW,VH);
+
+      // Distant parallax hills
+      const scroll = state.t * (state.speed * 0.15);
+      for (let i=0;i<3;i++){
+        const yBase = state.groundY - (90 + i*35);
+        ctx.beginPath();
+        ctx.moveTo(0, yBase);
+        const w = 220 + i*60;
+        for (let x = -w; x <= VW + w; x += w) {
+          const px = (x - (scroll * (0.3 + i*0.15)) % w);
+          ctx.quadraticCurveTo(px + w*0.25, yBase - 10, px + w*0.5, yBase);
+          ctx.quadraticCurveTo(px + w*0.75, yBase + 10, px + w, yBase);
+        }
+        ctx.lineTo(VW, VH); ctx.lineTo(0, VH); ctx.closePath();
+        ctx.fillStyle = ['#a9f0c9','#93e8bc','#7edfb0'][i];
+        ctx.fill();
+      }
+
+      // Ground
+      ctx.fillStyle = '#5bd18f';
+      ctx.fillRect(0, state.groundY, VW, VH - state.groundY);
+      // ground stripes
+      ctx.globalAlpha = .15;
+      for (let x = (-state.t*state.speed*2)%40 - 40; x < VW; x += 40) {
+        ctx.fillRect(x, state.groundY, 20, 6);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    function drawBird(b) {
+      // Body
+      ctx.save();
+      const bob = Math.sin(state.t * 0.15) * 1.5;
+      ctx.translate(b.x, b.y + bob);
+
+      // rotation indicates velocity
+      const rot = Math.max(-0.4, Math.min(0.6, b.vy * 0.03));
+      ctx.rotate(rot);
+
+      // body
+      ctx.fillStyle = '#333';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, b.r*1.1, b.r, 0, 0, Math.PI*2);
+      ctx.fill();
+
+      // belly
+      ctx.fillStyle = '#f8f8f8';
+      ctx.beginPath();
+      ctx.ellipse(-2, 4, b.r*0.8, b.r*0.6, 0, 0, Math.PI*2);
+      ctx.fill();
+
+      // wing flaps
+      const flap = Math.sin((state.t + b.flapAnim)*0.5) * 0.6 + 0.4;
+      ctx.fillStyle = '#444';
+      ctx.beginPath();
+      ctx.ellipse(-b.r*0.2, 0, b.r*0.7, b.r*flap, 0, 0, Math.PI*2);
+      ctx.fill();
+
+      // eye
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.arc(b.r*0.4, -b.r*0.2, b.r*0.28, 0, Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle = '#000';
+      ctx.beginPath();
+      ctx.arc(b.r*0.5, -b.r*0.2, b.r*0.12, 0, Math.PI*2);
+      ctx.fill();
+
+      // beak
+      ctx.fillStyle = '#ffb703';
+      ctx.beginPath();
+      ctx.moveTo(b.r*0.9, 0);
+      ctx.lineTo(b.r*1.5, -3);
+      ctx.lineTo(b.r*0.9, 3);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.restore();
+    }
+
+    function drawFruit(f) {
+      ctx.save();
+      ctx.translate(f.x, f.y);
+      if (f.type === FRUIT.BANANA) {
+        // Banana: crescent
+        ctx.rotate(-0.2);
+        ctx.lineWidth = 8;
+        ctx.strokeStyle = '#ffd54a';
+        ctx.beginPath();
+        ctx.arc(0, 0, f.r, Math.PI*0.3, Math.PI*1.7, false);
+        ctx.stroke();
+        // ends
+        ctx.fillStyle = '#8d6e63';
+        ctx.beginPath(); ctx.arc(-f.r*0.9, -3, 2.5, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(f.r*0.9, 3, 2.5, 0, Math.PI*2); ctx.fill();
+      } else {
+        // Pineapple: body
+        ctx.fillStyle = '#ffb300';
+        ctx.strokeStyle = '#e69500';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, f.r*0.95, f.r*1.1, 0, 0, Math.PI*2);
+        ctx.fill(); ctx.stroke();
+        // diamond pattern
+        ctx.strokeStyle = 'rgba(0,0,0,.2)';
+        for (let a=-f.r*1.5; a<=f.r*1.5; a+=6){
+          ctx.beginPath(); ctx.moveTo(-f.r, a); ctx.lineTo(f.r, a+f.r*1.6); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(f.r, a); ctx.lineTo(-f.r, a+f.r*1.6); ctx.stroke();
+        }
+        // leaves
+        ctx.fillStyle = '#2e7d32';
+        for (let i=0;i<4;i++){
+          ctx.beginPath();
+          ctx.moveTo(0,-f.r*1.1);
+          ctx.quadraticCurveTo(i%2?8:-8,-f.r*1.6, i%2?12:-12,-f.r*2.0);
+          ctx.quadraticCurveTo(i%2?6:-6,-f.r*1.6, 0,-f.r*1.1);
+          ctx.fill();
+        }
+      }
+      ctx.restore();
+    }
+
+    function drawHUD() {
+      // Score badge
+      ctx.fillStyle = 'rgba(255,255,255,.8)';
+      ctx.fillRect(12, 10, 110, 34);
+      ctx.fillStyle = '#0b1021';
+      ctx.font = 'bold 20px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('Score: ' + state.score, 20, 27);
+    }
+
+    function drawSplash() {
+      drawBackground();
+      drawBird(state.bird);
+      ctx.fillStyle = 'rgba(255,255,255,.9)';
+      ctx.fillRect(30, 120, VW-60, 180);
+      ctx.fillStyle = '#0b1021';
+      ctx.font = 'bold 28px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('Flappy Bananas', VW/2, 160);
+      ctx.font = '16px system-ui,-apple-system';
+      ctx.fillText('Tap to flap. Collect bananas (+1)', VW/2, 200);
+      ctx.fillText('Pineapples are worth double (+2).', VW/2, 224);
+      ctx.fillText('Speed increases as you score!', VW/2, 248);
+      ctx.font = 'bold 18px system-ui,-apple-system';
+      ctx.fillText('Tap anywhere to start', VW/2, 290);
+      drawHUD();
+    }
+
+    function drawGameOver() {
+      drawBackground();
+      // fruits still on screen
+      for (const f of state.fruits) drawFruit(f);
+      drawBird(state.bird);
+      drawHUD();
+
+      // overlay
+      ctx.fillStyle = 'rgba(0,0,0,.5)';
+      ctx.fillRect(0,0,VW,VH);
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 34px system-ui,-apple-system';
+      ctx.fillText('Game Over', VW/2, VH/2 - 30);
+      ctx.font = '18px system-ui,-apple-system';
+      ctx.fillText('Score: ' + state.score, VW/2, VH/2 + 2);
+      ctx.fillText('Tap to play again', VW/2, VH/2 + 34);
+    }
+
+    // ---------- Game loop ----------
+    let raf = null;
+    function startGame() {
+      // reset state
+      state.mode = 'play';
+      state.score = 0;
+      state.speed = state.baseSpeed;
+      state.fruits = [];
+      state.bird.x = 80;
+      state.bird.y = VH/2;
+      state.bird.vy = 0;
+      state.spawnCooldown = 0;
+      state.t = 0;
+      if (!raf) loop(performance.now());
+    }
+
+    function endGame() {
+      state.mode = 'over';
+      drawGameOver();
+    }
+
+    function loop(now) {
+      raf = requestAnimationFrame(loop);
+
+      // physics step
+      state.t += 1;
+
+      // background
+      drawBackground();
+
+      // update speed with difficulty ramp (smooth)
+      // +0.06 per point, capped a bit so it stays playable
+      const targetSpeed = state.baseSpeed + Math.min(4.5, state.score * 0.06);
+      state.speed += (targetSpeed - state.speed) * 0.03;
+
+      // Bird physics
+      state.bird.vy += state.gravity;
+      state.bird.y += state.bird.vy;
+
+      // Boundaries: top bounces a bit, ground ends game
+      if (state.bird.y < 20) {
+        state.bird.y = 20;
+        state.bird.vy = Math.max(0, state.bird.vy * 0.3);
+      }
+      if (state.bird.y + state.bird.r > state.groundY) {
+        state.bird.y = state.groundY - state.bird.r;
+        return endGame();
+      }
+
+      // Spawn fruits
+      if (state.spawnCooldown-- <= 0) {
+        spawnFruit();
+        // spawn interval depends on speed/score (harder = more frequent)
+        state.spawnCooldown = Math.max(28, 58 - Math.floor(state.score * 0.6));
+      }
+
+      // Update & draw fruits
+      for (let i = state.fruits.length - 1; i >= 0; i--) {
+        const f = state.fruits[i];
+        f.x += -state.speed; // match world speed
+
+        // Collision (circle-circle)
+        const dx = (state.bird.x) - f.x;
+        const dy = (state.bird.y) - f.y;
+        const rr = (state.bird.r + f.r) * (state.bird.r + f.r);
+        if (!f.eaten && (dx*dx + dy*dy) <= rr) {
+          f.eaten = true;
+          state.score += (f.type === FRUIT.BANANA) ? 1 : 2;
+        }
+
+        // Draw if visible
+        if (!f.eaten && f.x > -40) drawFruit(f);
+        // Remove if off screen or eaten
+        if (f.x < -50 || f.eaten) state.fruits.splice(i, 1);
+      }
+
+      // Draw bird & HUD
+      drawBird(state.bird);
+      drawHUD();
+
+      // Safety: stop loop if not playing (over/splash)
+      if (state.mode !== 'play') { cancelAnimationFrame(raf); raf = null; }
+    }
+
+    // Initial screen
+    drawSplash();
+  })();
+  </script>
+</body>
+</html>
